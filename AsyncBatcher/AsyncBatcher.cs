@@ -1,7 +1,8 @@
 // AsyncBatcher.cs
 // Coalesce many small async calls into efficient bulk operations
-// Author: Asim Faiaz 
+// Author: Asim Faiaz
 // License: MIT
+//#nullable enable
 
 using System;
 using System.Collections.Concurrent;
@@ -19,11 +20,11 @@ namespace Demo.AsyncUtils
 		- Internally collects up to MaxBatchSize or waits MaxBatchDelay, then invokes the provided bulkFunc.
 		- Maps per-item results back to callers using a user-provided resultSelector.
 
-    * Guarantees:
+     * Guarantees:
 		- Each call completes with its own result or throws if not found / bulk failed.
 		- Batching window is bounded by MaxBatchDelay or MaxBatchSize, whichever hits first.
 		- Backpressure-friendly: input channel is bounded to prevent unbounded memory growth (configurable).
-    */
+     */
     public sealed class AsyncBatcher<TIn, TBulkItem> : IAsyncDisposable
     {
         private readonly Func<IReadOnlyList<TIn>, CancellationToken, Task<IReadOnlyList<TBulkItem>>> _bulkFunc;
@@ -36,8 +37,8 @@ namespace Demo.AsyncUtils
         private readonly struct Enqueued
         {
             public readonly TIn Input;
-            public readonly TaskCompletionSource<object?> Tcs;
-            public Enqueued(TIn input, TaskCompletionSource<object?> tcs) { Input = input; Tcs = tcs; }
+            public readonly object TcsObj;
+            public Enqueued(TIn input, object tcsObj) { Input = input; TcsObj = tcsObj; }
         }
 
         public AsyncBatcher(
@@ -64,41 +65,30 @@ namespace Demo.AsyncUtils
         */
         public async Task<TOut> EnqueueAsync<TOut>(TIn input, CancellationToken ct = default)
         {
-            var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var enq = new Enqueued(input, tcs);
-
-            // Respect cancellation on enqueue
+            var tcs = new TaskCompletionSource<TOut>(TaskCreationOptions.RunContinuationsAsynchronously);
             using var reg = ct.Register(() => tcs.TrySetCanceled(ct));
-            await _channel.Writer.WriteAsync(enq, ct).ConfigureAwait(false);
-
-            var obj = await tcs.Task.ConfigureAwait(false);
-            return (TOut)obj!;
+            await _channel.Writer.WriteAsync(new Enqueued(input, tcs), ct).ConfigureAwait(false);
+            return await tcs.Task.ConfigureAwait(false);
         }
 
         private async Task PumpAsync()
         {
             var reader = _channel.Reader;
-
             var batch = new List<Enqueued>(_opt.MaxBatchSize);
-            var delayCts = (CancellationTokenSource?)null;
 
             try
             {
                 while (await reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
                 {
-                    // Start new batch window if needed
                     batch.Clear();
-                    delayCts?.Dispose();
-                    delayCts = new CancellationTokenSource();
 
-                    // read at least one item
+                    // Read first item
                     if (!reader.TryRead(out var first)) continue;
                     batch.Add(first);
 
                     // Start delay clock
                     var delayTask = Task.Delay(_opt.MaxBatchDelay, delayCts.Token);
 
-                    // Keep collecting until size reached or delay elapsed
                     while (batch.Count < _opt.MaxBatchSize)
                     {
                         if (reader.TryRead(out var next))
@@ -109,25 +99,19 @@ namespace Demo.AsyncUtils
 
                         var readTask = reader.ReadAsync(_cts.Token).AsTask();
                         var completed = await Task.WhenAny(readTask, delayTask).ConfigureAwait(false);
-
                         if (completed == delayTask)
-                            break; // time window elapsed
+                            break;
 
-                        // got another item
                         batch.Add(await readTask.ConfigureAwait(false));
                     }
 
-                    // Stop the delay
                     delayCts.Cancel();
-
-                    // Execute this batch
                     _ = ExecuteBatchAsync(batch);
                 }
             }
-            catch (OperationCanceledException) { /* shutting down */ }
-            finally
+            catch (OperationCanceledException)
             {
-                delayCts?.Dispose();
+                // Shutting down
             }
         }
 
@@ -135,40 +119,51 @@ namespace Demo.AsyncUtils
         {
             if (batch.Count == 0) return;
 
-            // Prepare inputs and linked CTS for batch timeout
             var inputs = batch.Select(b => b.Input).ToArray();
             using var timeoutCts = new CancellationTokenSource(_opt.BatchTimeout);
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, _cts.Token);
 
             try
             {
-                var bulk = await _bulkFunc(inputs, linked.Token).ConfigureAwait(false);
-                if (bulk is null) throw new InvalidOperationException("Bulk function returned null.");
+                var bulk = await _bulkFunc(inputs, linked.Token).ConfigureAwait(false)
+                           ?? throw new InvalidOperationException("Bulk function returned null.");
 
-                // Build lookup: for each input, find matching bulk item(s)
-                // Usually 1:1, but allow first match; you can override matching via _resultSelector.
                 foreach (var enq in batch)
                 {
                     var match = bulk.FirstOrDefault(b => _resultSelector(b, enq.Input));
                     if (match is null)
                     {
-                        enq.Tcs.TrySetException(new KeyNotFoundException($"No result for input '{enq.Input}'."));
+                        SetException(enq.TcsObj, new KeyNotFoundException($"No result for input '{enq.Input}'."));
                     }
                     else
                     {
-                        enq.Tcs.TrySetResult(match!);
+                        SetResult(enq.TcsObj, match);
                     }
                 }
             }
             catch (OperationCanceledException oce)
             {
                 var ex = new TimeoutException($"Batch timed out after {_opt.BatchTimeout}.", oce);
-                foreach (var enq in batch) enq.Tcs.TrySetException(ex);
+                foreach (var enq in batch) SetException(enq.TcsObj, ex);
             }
             catch (Exception ex)
             {
-                foreach (var enq in batch) enq.Tcs.TrySetException(ex);
+                foreach (var enq in batch) SetException(enq.TcsObj, ex);
             }
+        }
+
+        private static void SetResult(object tcsObj, TBulkItem value)
+        {
+            var tcsType = tcsObj.GetType();
+            var setMethod = tcsType.GetMethod("TrySetResult");
+            setMethod?.Invoke(tcsObj, new object?[] { value });
+        }
+
+        private static void SetException(object tcsObj, Exception ex)
+        {
+            var tcsType = tcsObj.GetType();
+            var setMethod = tcsType.GetMethod("TrySetException", new[] { typeof(Exception) });
+            setMethod?.Invoke(tcsObj, new object?[] { ex });
         }
 
         public async ValueTask DisposeAsync()
@@ -180,19 +175,12 @@ namespace Demo.AsyncUtils
         }
     }
 
-    // Options for AsyncBatcher: controls windowing and safety.
+    // Options for AsyncBatcher: controls windowing and safety
     public sealed class AsyncBatcherOptions
     {
-        // Max items in a single batch
         public int MaxBatchSize { get; init; } = 100;
-
-        // Max time to wait for more items before dispatching a batch
         public TimeSpan MaxBatchDelay { get; init; } = TimeSpan.FromMilliseconds(10);
-
-        / Max time the bulk operation is allowed to run for a batch
         public TimeSpan BatchTimeout { get; init; } = TimeSpan.FromSeconds(10);
-
-        // Channel capacity to bound memory; callers await when full
         public int ChannelCapacity { get; init; } = 10_000;
     }
 }
