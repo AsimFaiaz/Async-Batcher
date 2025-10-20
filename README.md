@@ -148,6 +148,47 @@ new AsyncBatcherOptions
 };
   </pre>
 
+  <h2>Manual Testing - .NET Fiddle</h2>
+  <pre>
+//To Test in .NET Fiddle simply paste this code under the main CS code
+public static class Program
+    {
+        public static async Task Main()
+        {
+            Console.WriteLine("Starting AsyncBatcher demo...\n");
+
+            async Task<IReadOnlyList<string>> BulkUppercase(IReadOnlyList<string> inputs, CancellationToken ct)
+            {
+                Console.WriteLine($"Bulk called for [{string.Join(", ", inputs)}] (count={inputs.Count})");
+                await Task.Delay(500, ct); 
+                return inputs.Select(s => s.ToUpperInvariant()).ToArray();
+            }
+
+            using var batcher = new AsyncBatcher<string, string>(
+                BulkUppercase,
+                (bulk, input) => bulk.Equals(input, StringComparison.OrdinalIgnoreCase),
+                new AsyncBatcherOptions { MaxBatchSize = 4, MaxBatchDelay = TimeSpan.FromMilliseconds(200) }
+            );
+
+            var tasks = new List<Task>();
+
+            for (int i = 1; i <= 10; i++)
+            {
+                var word = "word" + i;
+                tasks.Add(Task.Run(async () =>
+                {
+                    var result = await batcher.EnqueueAsync<string>(word);
+                    Console.WriteLine($"Result for {word} → {result}");
+                }));
+
+                await Task.Delay(i % 3 == 0 ? 250 : 50);
+            }
+
+            await Task.WhenAll(tasks);
+        }
+    }
+  </pre>
+
   <h2>Use Cases</h2>
   <ul>
     <li><strong>Database:</strong> replace loops with <code>IN (...)</code> bulk SELECTs</li>
